@@ -1,0 +1,124 @@
+id: docker-hub-stale-base-image
+namespace: company.team
+
+triggers:
+  - id: weekly
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 9 * * 1"
+
+inputs:
+  - id: images
+    type: ARRAY
+    itemType: STRING
+    defaults:
+      - "library/python:3.12-slim"
+      - "library/postgres:16"
+      - "library/nginx:alpine"
+  - id: max_age_days
+    type: INT
+    defaults: 90
+
+tasks:
+  - id: check_images
+    type: io.kestra.plugin.core.flow.Loop
+    values: "{{ inputs.images }}"
+    tasks:
+      - id: fetch_tag
+        type: io.kestra.plugin.core.http.Request
+        uri: "https://hub.docker.com/v2/repositories/{{ item.value | split(':') | first }}/tags/{{ item.value | split(':') | last }}"
+        options:
+          allowFailed: true
+
+      - id: evaluate_age
+        type: io.kestra.plugin.scripts.python.Script
+        dependencies:
+          - kestra
+        inputFiles:
+          tag.json: "{{ outputs.fetch_tag.body }}"
+        script: |
+          from datetime import datetime, timezone
+          from kestra import Kestra
+          import json
+
+          code = int("{{ outputs.fetch_tag.code ?? 0 }}")
+          image = "{{ item.value }}"
+          max_age = int("{{ inputs.max_age_days }}")
+          stale, msg = True, f"{image}: Hub HTTP {code} (tag missing?)"
+
+          if code == 200:
+              last = json.load(open("tag.json"))["last_updated"]
+              days = (datetime.now(timezone.utc) - datetime.fromisoformat(last.replace("Z", "+00:00"))).days
+              stale = days >= max_age
+              msg = f"{image} last moved {days} days ago ({last})"
+
+          Kestra.outputs({"is_stale": stale, "alert_message": msg})
+
+      - id: maybe_alert
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.evaluate_age.vars.is_stale == true }}"
+        then:
+          - id: slack_stale
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            messageText: "Stale Docker Hub base image: {{ outputs.evaluate_age.vars.alert_message }}"
+        else:
+          - id: log_fresh
+            type: io.kestra.plugin.core.log.Log
+            message: "{{ outputs.evaluate_age.vars.alert_message }}"
+
+extend:
+  title: Alert When Docker Hub Base Images Go Stale
+  shortDescription: Weekly loop over pinned Hub tags that pages Slack when last_updated is older than max_age_days.
+  metaTitle: Docker Hub Stale Base Image Alerts with Kestra
+  metaDescription: Watch Docker Hub tags on a schedule. If a base image is older than your age limit, Kestra pages Slack so stale FROM lines do not rot in production.
+  description: |
+    Dockerfiles pin tags like `python:3.12-slim` and then never look at Hub again. This flow asks Docker Hub when each of your base tags last moved and pages Slack when `last_updated` is older than `max_age_days` (default 90) or the tag is gone. It watches the images you depend on, not the images you build.
+
+    ## How it works
+    1. `Schedule` runs every Monday at 09:00 UTC.
+    2. `Loop` walks `images` (`namespace/repository:tag`; official images need `library/`).
+    3. `http.Request` GETs the Hub tag API with `allowFailed` so a 404 still alerts.
+    4. A short Python script sets `is_stale` from `last_updated`.
+    5. `If` posts to Slack only when stale; fresh tags only log.
+
+    ## What you get
+    - One Slack message per stale or missing tag.
+    - Outputs: `{{ outputs.evaluate_age.vars.is_stale }}`, `{{ outputs.evaluate_age.vars.alert_message }}`.
+
+    ## Who it's for
+    Platform and app teams that pin Hub tags in production `FROM` lines.
+
+    ## Why orchestrate this with Kestra
+    Hub only stores `last_updated`. Kestra adds the weekly schedule, the loop, the age policy, and Slack.
+
+    ## Prerequisites
+    - Python script plugin (`dependencies: kestra`) and Slack notifications plugin.
+    - Worker access to `https://hub.docker.com` (public tags, no Hub token).
+
+    ### Inputs
+    - `images`: `namespace/repository:tag` (not `python:3.12-slim`, not a digest).
+    - `max_age_days`: default 90.
+
+    ### Secrets
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook for stale-image alerts.
+
+    ## Quick start
+    1. Set `SLACK_WEBHOOK_URL`.
+    2. Put your Dockerfile tags in `images`.
+    3. Run once. To force Slack, set `max_age_days` to `0`.
+
+    ## How to extend
+    - Add a webhook trigger from CI when a `FROM` line changes.
+    - Chain a rebuild flow instead of only alerting.
+
+    ## Links
+    - [Hub tag API example](https://hub.docker.com/v2/repositories/library/python/tags/3.12-slim)
+    - [Slack plugin](https://kestra.io/plugins/plugin-notifications)
+    - [Python script plugin](https://kestra.io/plugins/plugin-script-python)
+  tags:
+    - Infrastructure
+  subTags:
+    - Monitoring & Alerting
+    - Docker
+  ee: false
+  demo: false
